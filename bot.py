@@ -550,19 +550,71 @@ def undelivered_sync() -> list:
     return out
 
 
-def upload_photo_sync(data: bytes, name: str) -> str:
-    date_str = datetime.now(TZ).strftime("%Y-%m-%d")
-    folder = _date_folders.get(date_str)
-    if not folder:
-        folder = _drive_folder(date_str, FOLDER_ID)
-        _date_folders[date_str] = folder
-    media = MediaIoBaseUpload(io.BytesIO(data), mimetype="image/jpeg", resumable=False)
-    created = drive_service.files().create(
-        body={"name": f"{name}.jpg", "parents": [folder]},
-        media_body=media,
-        fields="id, webViewLink",
-    ).execute()
-    return created.get("webViewLink", "")
+def _reset_drive_service() -> None:
+    """Перестворює клієнт Drive: старе HTTP-з'єднання могло «протухнути»."""
+    global drive_service
+    drive_service = build("drive", "v3", credentials=_google_creds, cache_discovery=False)
+
+
+def upload_photo_sync(data: bytes, name: str, date_str: str = "") -> str:
+    date_str = date_str or datetime.now(TZ).strftime("%Y-%m-%d")
+    last_exc = None
+    for attempt in range(1, 4):
+        try:
+            folder = _date_folders.get(date_str)
+            if not folder:
+                folder = _drive_folder(date_str, FOLDER_ID)
+                _date_folders[date_str] = folder
+            media = MediaIoBaseUpload(io.BytesIO(data), mimetype="image/jpeg", resumable=False)
+            created = drive_service.files().create(
+                body={"name": f"{name}.jpg", "parents": [folder]},
+                media_body=media,
+                fields="id, webViewLink",
+            ).execute(num_retries=2)
+            link = created.get("webViewLink", "")
+            if link:
+                return link
+            raise RuntimeError("Drive не повернув webViewLink")
+        except Exception as e:
+            last_exc = e
+            logger.warning("Drive upload %s: спроба %d невдала: %r", name, attempt, e)
+            _reset_drive_service()
+            time.sleep(1.5 * attempt)
+    raise last_exc
+
+
+def missing_photos_sync() -> list:
+    """Основні заявки (будь-який статус) без photo_url, але з telegram_file_id."""
+    values = WS_PART.get_all_values()[1:]
+    out = []
+    for r in values:
+        r = r + [""] * (len(COLS) - len(r))
+        if r[C["chance_type"]] == "duplicate":
+            continue
+        if not r[C["photo_url"]].strip() and r[C["telegram_file_id"]].strip():
+            out.append({
+                "application_id": r[C["application_id"]],
+                "file_id": r[C["telegram_file_id"]],
+                "source_key": r[C["source_key"]],
+                "surname": r[C["surname"]],
+                "date": (r[C["timestamp"]] or "")[:10],
+            })
+    return out
+
+
+def set_photo_url_sync(app_id: str, url: str) -> int:
+    """Записує посилання в заявку та всі її дублікати. Нічого іншого не змінює."""
+    values = WS_PART.get_all_values()
+    data = []
+    for i, r in enumerate(values[1:], start=2):
+        r = r + [""] * (len(COLS) - len(r))
+        if (r[C["application_id"]] == app_id or r[C["base_application_id"]] == app_id) and not r[C["photo_url"]].strip():
+            a1 = gspread.utils.rowcol_to_a1(i, C["photo_url"] + 1)
+            data.append({"range": a1, "values": [[url]]})
+    if data:
+        WS_PART.batch_update(data, value_input_option="RAW")
+        _log_sync("photo_backfill", app_id, f"{len(data)} rows")
+    return len(data)
 
 
 # ----------------------------------------------------------------------------
@@ -629,6 +681,44 @@ async def deliver_to_moderators(bot, app: dict) -> bool:
     except Exception:
         logger.exception("Не вдалося оновити delivery_status для %s", app["application_id"])
     return True
+
+
+# ----------------------------------------------------------------------------
+# Дозбереження фото, які не вдалося завантажити в Drive одразу
+# ----------------------------------------------------------------------------
+_backfill_lock = asyncio.Lock()
+
+
+async def backfill_photos(bot) -> tuple:
+    if _backfill_lock.locked():
+        return (0, 0)
+    async with _backfill_lock:
+        items = await gcall(missing_photos_sync)
+        ok = 0
+        for it in items:
+            try:
+                tg_file = await bot.get_file(it["file_id"])
+                data = bytes(await tg_file.download_as_bytearray())
+                safe = re.sub(r"[^\w\-]+", "_", it["surname"])[:30]
+                base = (it["source_key"] or it["application_id"]).replace(":", "_")
+                url = await gcall(upload_photo_sync, data, f"{base}_{safe}", it["date"])
+                await gcall(set_photo_url_sync, it["application_id"], url)
+                ok += 1
+            except Exception:
+                logger.exception("Backfill фото для %s не вдався", it["application_id"])
+        if items:
+            logger.info("Backfill фото: %d з %d", ok, len(items))
+        return (ok, len(items))
+
+
+async def _backfill_loop(bot) -> None:
+    await asyncio.sleep(30)
+    while True:
+        try:
+            await backfill_photos(bot)
+        except Exception:
+            logger.exception("Помилка циклу backfill")
+        await asyncio.sleep(600)  # кожні 10 хвилин
 
 
 # ----------------------------------------------------------------------------
@@ -964,6 +1054,7 @@ async def cmd_admin(update, context):
         "/deactivate — закрити реєстрацію\n"
         "/resend — повторно надіслати недоставлені заявки модератору\n"
         "/recover — дозавершити перервані підтвердження\n"
+        "/fixphotos — дозберегти в Drive фото без посилань\n"
         "/chatid — ID чату"
     )
 
@@ -1091,6 +1182,13 @@ async def cmd_resend(update, context):
 
 
 @admin_only
+async def cmd_fixphotos(update, context):
+    await update.message.reply_text("⏳ Дозберігаю фото без посилань…")
+    ok, total = await backfill_photos(context.bot)
+    await update.message.reply_text(f"📷 Збережено фото: {ok} з {total}.")
+
+
+@admin_only
 async def cmd_recover(update, context):
     done = await gcall(recover_incomplete_sync)
     await _notify_recovered(context.bot, done)
@@ -1146,6 +1244,7 @@ async def post_init(app):
         BotCommand("deactivate", "Закрити реєстрацію"),
         BotCommand("resend", "Повторити недоставлені"),
         BotCommand("recover", "Дозавершити підтвердження"),
+        BotCommand("fixphotos", "Дозберегти фото в Drive"),
         BotCommand("admin", "Адмін-команди"),
     ]
     for admin_id in ADMIN_IDS:
@@ -1161,6 +1260,8 @@ async def post_init(app):
             await notify_admins(app.bot, f"♻️ Після перезапуску дозавершено підтвердження заявок: {len(done)}.")
     except Exception:
         logger.exception("Помилка відновлення після перезапуску")
+
+    app.create_task(_backfill_loop(app.bot))
 
     if INFRA_CREATED:
         await notify_admins(
@@ -1204,6 +1305,7 @@ def main():
         ("activate", cmd_activate), ("deactivate", cmd_deactivate), ("setterms", cmd_setterms),
         ("setdate", cmd_setdate), ("setstartdate", cmd_setstartdate), ("resetcounter", cmd_resetcounter),
         ("setnumber", cmd_setnumber), ("resend", cmd_resend), ("recover", cmd_recover),
+        ("fixphotos", cmd_fixphotos),
     ]:
         app.add_handler(CommandHandler(name, fn))
 
